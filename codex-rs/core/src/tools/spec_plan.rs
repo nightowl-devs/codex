@@ -7,7 +7,13 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::code_mode::execute_spec::create_code_mode_tool;
 use crate::tools::effective_tool_mode;
 use crate::tools::handlers::ApplyPatchHandler;
+use crate::tools::handlers::BashHandler;
 use crate::tools::handlers::CodeModeExecuteHandler;
+use crate::tools::handlers::EditHandler;
+use crate::tools::handlers::GlobHandler;
+use crate::tools::handlers::GrepHandler;
+use crate::tools::handlers::ReadHandler;
+use crate::tools::handlers::WriteHandler;
 use crate::tools::handlers::CodeModeWaitHandler;
 use crate::tools::handlers::CurrentTimeHandler;
 use crate::tools::handlers::DynamicToolHandler;
@@ -1190,6 +1196,7 @@ fn add_core_tool_sources(context: &CoreToolPlanContext<'_>, registry: &mut ToolR
         return;
     }
 
+    add_gate_tools(context, registry);
     add_shell_tools(context, registry);
     add_mcp_resource_tools(context, registry);
     add_core_utility_tools(context, registry);
@@ -1228,6 +1235,19 @@ fn should_include_windows_shell_guidance(environments: &TurnEnvironmentSnapshot)
         Some(platform_os) => platform_os == "windows",
         None => cfg!(windows),
     }
+}
+
+/// The OpenCode gate tool set (bash/edit/glob/grep/read/write). Shipping these
+/// natively means the free-tier gateway's schema gate is satisfied by Codex's
+/// own request, and Codex executes the calls itself so they stay visible.
+#[instrument(level = "trace", skip_all)]
+fn add_gate_tools(_context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistry) {
+    registry.add(BashHandler);
+    registry.add(EditHandler);
+    registry.add(GlobHandler);
+    registry.add(GrepHandler);
+    registry.add(ReadHandler);
+    registry.add(WriteHandler);
 }
 
 #[instrument(level = "trace", skip_all)]
