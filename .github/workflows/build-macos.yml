@@ -1,0 +1,33 @@
+name: build-macos
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: patched-build
+      - name: Install pinned toolchain
+        working-directory: codex-rs
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+      - name: Build codex-cli (release)
+        working-directory: codex-rs
+        run: cargo build --release -p codex-cli
+      - name: Package
+        run: |
+          mkdir -p out
+          cp codex-rs/target/release/codex out/codex
+          shasum -a 256 out/codex | tee out/codex.sha256
+          file out/codex
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-aarch64-apple-darwin
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
