@@ -1,0 +1,21 @@
+name: check
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: patched-build
+      - name: Install pinned toolchain
+        working-directory: codex-rs
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+      - name: cargo check codex-core
+        working-directory: codex-rs
+        run: cargo check -p codex-core
