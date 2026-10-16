@@ -20,6 +20,7 @@ use crate::tools::handlers::gate_tools_spec::create_grep_tool;
 use crate::tools::handlers::gate_tools_spec::create_read_tool;
 use crate::tools::handlers::gate_tools_spec::create_write_tool;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use codex_protocol::items::CommandExecutionItem;
@@ -60,15 +61,21 @@ fn cap(mut text: String) -> String {
     text
 }
 
-fn resolve(path: &str) -> PathBuf {
+fn resolve(path: &str, base: &Path) -> PathBuf {
     let p = Path::new(path);
     if p.is_absolute() {
         p.to_path_buf()
     } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(p)
+        base.join(p)
     }
+}
+
+/// The session's workspace root, used to resolve relative tool paths instead of
+/// the app-server process cwd (which is `/` when launched from the desktop app).
+fn default_cwd(invocation: &ToolInvocation) -> PathBuf {
+    resolve_tool_environment(&invocation.step_context.environments, None)
+        .map(|environment| environment.cwd().to_path_buf())
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 fn path_uri(path: &Path) -> PathUri {
@@ -150,6 +157,7 @@ impl ToolExecutor<ToolInvocation> for BashHandler {
         ToolInvocation: 'a,
     {
         Box::pin(async move {
+            let base = default_cwd(&invocation);
             let ToolPayload::Function { arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "bash handler received unsupported payload".to_string(),
@@ -168,8 +176,8 @@ impl ToolExecutor<ToolInvocation> for BashHandler {
             let cwd = args
                 .workdir
                 .as_deref()
-                .map(resolve)
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+                .map(|workdir| resolve(workdir, &base))
+                .unwrap_or(base);
 
             let session = invocation.session.clone();
             let turn = invocation.turn.clone();
@@ -357,13 +365,14 @@ impl ToolExecutor<ToolInvocation> for ReadHandler {
         ToolInvocation: 'a,
     {
         Box::pin(async move {
+            let base = default_cwd(&invocation);
             let ToolPayload::Function { arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "read handler received unsupported payload".to_string(),
                 ));
             };
             let args: ReadArgs = parse_arguments(&arguments)?;
-            let path = resolve(&args.filePath);
+            let path = resolve(&args.filePath, &base);
 
             if path.is_dir() {
                 let mut entries: Vec<String> = std::fs::read_dir(&path)
@@ -448,13 +457,14 @@ impl ToolExecutor<ToolInvocation> for WriteHandler {
         ToolInvocation: 'a,
     {
         Box::pin(async move {
+            let base = default_cwd(&invocation);
             let ToolPayload::Function { arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "write handler received unsupported payload".to_string(),
                 ));
             };
             let args: WriteArgs = parse_arguments(&arguments)?;
-            let path = resolve(&args.filePath);
+            let path = resolve(&args.filePath, &base);
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -563,13 +573,14 @@ impl ToolExecutor<ToolInvocation> for EditHandler {
         ToolInvocation: 'a,
     {
         Box::pin(async move {
+            let base = default_cwd(&invocation);
             let ToolPayload::Function { arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "edit handler received unsupported payload".to_string(),
                 ));
             };
             let args: EditArgs = parse_arguments(&arguments)?;
-            let path = resolve(&args.filePath);
+            let path = resolve(&args.filePath, &base);
             let text = match std::fs::read_to_string(&path) {
                 Ok(t) => t,
                 Err(e) => {
@@ -722,6 +733,7 @@ impl ToolExecutor<ToolInvocation> for GlobHandler {
         ToolInvocation: 'a,
     {
         Box::pin(async move {
+            let base = default_cwd(&invocation);
             let ToolPayload::Function { arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "glob handler received unsupported payload".to_string(),
@@ -732,8 +744,8 @@ impl ToolExecutor<ToolInvocation> for GlobHandler {
                 .path
                 .as_deref()
                 .filter(|p| !p.is_empty())
-                .map(resolve)
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+                .map(|p| resolve(p, &base))
+                .unwrap_or(base);
             let dir_str = dir.to_string_lossy().into_owned();
             // Always pass an explicit path operand so rg never reads stdin.
             let argv = vec![
@@ -776,6 +788,7 @@ impl ToolExecutor<ToolInvocation> for GrepHandler {
         ToolInvocation: 'a,
     {
         Box::pin(async move {
+            let base = default_cwd(&invocation);
             let ToolPayload::Function { arguments } = invocation.payload else {
                 return Err(FunctionCallError::RespondToModel(
                     "grep handler received unsupported payload".to_string(),
@@ -786,8 +799,8 @@ impl ToolExecutor<ToolInvocation> for GrepHandler {
                 .path
                 .as_deref()
                 .filter(|p| !p.is_empty())
-                .map(resolve)
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+                .map(|p| resolve(p, &base))
+                .unwrap_or(base);
             let dir_str = dir.to_string_lossy().into_owned();
             let mut argv = vec![
                 "-n".to_string(),
