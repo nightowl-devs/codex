@@ -28,6 +28,9 @@ jobs:
           workspaces: codex-rs
       - name: Build codex-cli (release)
         working-directory: codex-rs
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_DEBUG: "false"
         run: cargo build --release -p codex-cli
       - name: Package
         run: |
