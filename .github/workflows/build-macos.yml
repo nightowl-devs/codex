@@ -1,10 +1,20 @@
 name: build-macos
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner label (Blacksmith labels require the Blacksmith GitHub App)'
+        required: false
+        default: blacksmith-12vcpu-macos-15
+        type: choice
+        options:
+          - blacksmith-12vcpu-macos-15
+          - blacksmith-6vcpu-macos-15
+          - macos-14
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: ${{ inputs.runner || 'blacksmith-12vcpu-macos-15' }}
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
