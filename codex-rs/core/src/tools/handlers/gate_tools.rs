@@ -7,6 +7,8 @@
 //! name restoration is needed on the wire.
 
 use crate::function_tool::FunctionCallError;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -20,12 +22,24 @@ use crate::tools::handlers::gate_tools_spec::create_write_tool;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use codex_protocol::items::CommandExecutionItem;
+use codex_protocol::items::CommandExecutionStatus;
+use codex_protocol::items::FileChangeItem;
+use codex_protocol::items::TurnItem;
+use codex_protocol::parse_command::ParsedCommand;
+use codex_protocol::protocol::ExecCommandSource;
+use codex_protocol::protocol::FileChange;
+use codex_protocol::protocol::PatchApplyStatus;
+use codex_shell_command::parse_command::parse_command;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
+use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::time::Instant;
 
 const MAX_OUTPUT_BYTES: usize = 128_000;
 const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
@@ -55,6 +69,58 @@ fn resolve(path: &str) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(p)
     }
+}
+
+fn path_uri(path: &Path) -> PathUri {
+    PathUri::from_host_native_path(path).unwrap_or_else(|_| {
+        PathUri::from_abs_path(
+            &codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path("/")
+                .expect("root path is absolute"),
+        )
+    })
+}
+
+fn make_unified_diff(old: &str, new: &str) -> String {
+    similar::TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(3)
+        .to_string()
+}
+
+async fn emit_bash_completed(
+    session: &Session,
+    turn: &TurnContext,
+    call_id: &str,
+    command: &[String],
+    cwd: &PathUri,
+    parsed_cmd: &[ParsedCommand],
+    status: CommandExecutionStatus,
+    aggregated_output: String,
+    exit_code: Option<i32>,
+    duration: Duration,
+) {
+    session
+        .emit_turn_item_completed(
+            turn,
+            TurnItem::CommandExecution(CommandExecutionItem {
+                id: call_id.to_string(),
+                plugin_id: None,
+                script_path: None,
+                process_id: None,
+                command: command.to_vec(),
+                cwd: cwd.clone(),
+                parsed_cmd: parsed_cmd.to_vec(),
+                source: ExecCommandSource::UnifiedExecStartup,
+                interaction_input: None,
+                status,
+                aggregated_output: Some(aggregated_output),
+                exit_code,
+                duration: Some(duration),
+                sandbox_type: None,
+                model_context: None,
+            }),
+        )
+        .await;
 }
 
 // ------------------------------------------------------------------- bash
@@ -105,6 +171,40 @@ impl ToolExecutor<ToolInvocation> for BashHandler {
                 .map(resolve)
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
+            let session = invocation.session.clone();
+            let turn = invocation.turn.clone();
+            let call_id = invocation.call_id.clone();
+            let command_vec = vec![
+                "zsh".to_string(),
+                "-c".to_string(),
+                args.command.clone(),
+            ];
+            let parsed_cmd = parse_command(&command_vec);
+            let cwd_uri = path_uri(&cwd);
+            let started_at = Instant::now();
+            session
+                .emit_turn_item_started(
+                    turn.as_ref(),
+                    &TurnItem::CommandExecution(CommandExecutionItem {
+                        id: call_id.clone(),
+                        plugin_id: None,
+                        script_path: None,
+                        process_id: None,
+                        command: command_vec.clone(),
+                        cwd: cwd_uri.clone(),
+                        parsed_cmd: parsed_cmd.clone(),
+                        source: ExecCommandSource::UnifiedExecStartup,
+                        interaction_input: None,
+                        status: CommandExecutionStatus::InProgress,
+                        aggregated_output: None,
+                        exit_code: None,
+                        duration: None,
+                        sandbox_type: None,
+                        model_context: None,
+                    }),
+                )
+                .await;
+
             let mut cmd = tokio::process::Command::new("zsh");
             cmd.arg("-c")
                 .arg(&args.command)
@@ -117,8 +217,22 @@ impl ToolExecutor<ToolInvocation> for BashHandler {
             let child = match cmd.spawn() {
                 Ok(child) => child,
                 Err(e) => {
+                    let text = format!("error: failed to spawn command: {e}");
+                    emit_bash_completed(
+                        &session,
+                        turn.as_ref(),
+                        &call_id,
+                        &command_vec,
+                        &cwd_uri,
+                        &parsed_cmd,
+                        CommandExecutionStatus::Failed,
+                        text.clone(),
+                        None,
+                        started_at.elapsed(),
+                    )
+                    .await;
                     return Ok(boxed_tool_output(FunctionToolOutput::from_text(
-                        format!("error: failed to spawn command: {e}"),
+                        text,
                         Some(false),
                     )));
                 }
@@ -130,14 +244,46 @@ impl ToolExecutor<ToolInvocation> for BashHandler {
             )
             .await
             {
-                Err(_) => Ok(boxed_tool_output(FunctionToolOutput::from_text(
-                    format!("error: command timed out after {timeout}ms"),
-                    Some(false),
-                ))),
-                Ok(Err(e)) => Ok(boxed_tool_output(FunctionToolOutput::from_text(
-                    format!("error: command failed: {e}"),
-                    Some(false),
-                ))),
+                Err(_) => {
+                    let text = format!("error: command timed out after {timeout}ms");
+                    emit_bash_completed(
+                        &session,
+                        turn.as_ref(),
+                        &call_id,
+                        &command_vec,
+                        &cwd_uri,
+                        &parsed_cmd,
+                        CommandExecutionStatus::Failed,
+                        text.clone(),
+                        None,
+                        started_at.elapsed(),
+                    )
+                    .await;
+                    Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                        text,
+                        Some(false),
+                    )))
+                }
+                Ok(Err(e)) => {
+                    let text = format!("error: command failed: {e}");
+                    emit_bash_completed(
+                        &session,
+                        turn.as_ref(),
+                        &call_id,
+                        &command_vec,
+                        &cwd_uri,
+                        &parsed_cmd,
+                        CommandExecutionStatus::Failed,
+                        text.clone(),
+                        None,
+                        started_at.elapsed(),
+                    )
+                    .await;
+                    Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                        text,
+                        Some(false),
+                    )))
+                }
                 Ok(Ok(o)) => {
                     let success = o.status.success();
                     let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
@@ -152,8 +298,27 @@ impl ToolExecutor<ToolInvocation> for BashHandler {
                         let code = o.status.code().unwrap_or(-1);
                         s.push_str(&format!("\nexit code {code}"));
                     }
+                    let output = cap(s);
+                    let status = if success {
+                        CommandExecutionStatus::Completed
+                    } else {
+                        CommandExecutionStatus::Failed
+                    };
+                    emit_bash_completed(
+                        &session,
+                        turn.as_ref(),
+                        &call_id,
+                        &command_vec,
+                        &cwd_uri,
+                        &parsed_cmd,
+                        status,
+                        output.clone(),
+                        o.status.code(),
+                        started_at.elapsed(),
+                    )
+                    .await;
                     Ok(boxed_tool_output(FunctionToolOutput::from_text(
-                        cap(s),
+                        output,
                         Some(success),
                     )))
                 }
@@ -293,15 +458,74 @@ impl ToolExecutor<ToolInvocation> for WriteHandler {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
+            let session = invocation.session.clone();
+            let turn = invocation.turn.clone();
+            let call_id = invocation.call_id.clone();
+            let change = match std::fs::read_to_string(&path) {
+                Ok(prev) => FileChange::Update {
+                    unified_diff: make_unified_diff(&prev, &args.content),
+                    move_path: None,
+                },
+                Err(_) => FileChange::Add {
+                    content: args.content.clone(),
+                },
+            };
+            let mut changes = HashMap::new();
+            changes.insert(path.clone(), change);
+            session
+                .emit_turn_item_started(
+                    turn.as_ref(),
+                    &TurnItem::FileChange(FileChangeItem {
+                        id: call_id.clone(),
+                        changes: changes.clone(),
+                        status: None,
+                        auto_approved: Some(true),
+                        stdout: None,
+                        stderr: None,
+                    }),
+                )
+                .await;
             match std::fs::write(&path, args.content.as_bytes()) {
-                Ok(()) => Ok(boxed_tool_output(FunctionToolOutput::from_text(
-                    format!("wrote {}", path.display()),
-                    Some(true),
-                ))),
-                Err(e) => Ok(boxed_tool_output(FunctionToolOutput::from_text(
-                    format!("error: {e}"),
-                    Some(false),
-                ))),
+                Ok(()) => {
+                    let text = format!("wrote {}", path.display());
+                    session
+                        .emit_turn_item_completed(
+                            turn.as_ref(),
+                            TurnItem::FileChange(FileChangeItem {
+                                id: call_id.clone(),
+                                changes,
+                                status: Some(PatchApplyStatus::Completed),
+                                auto_approved: None,
+                                stdout: Some(text.clone()),
+                                stderr: Some(String::new()),
+                            }),
+                        )
+                        .await;
+                    Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                        text,
+                        Some(true),
+                    )))
+                }
+                Err(e) => {
+                    let text = format!("error: {e}");
+                    session
+                        .emit_turn_item_completed(
+                            turn.as_ref(),
+                            TurnItem::FileChange(FileChangeItem {
+                                id: call_id.clone(),
+                                changes,
+                                status: Some(PatchApplyStatus::Failed),
+                                auto_approved: None,
+                                stdout: None,
+                                stderr: Some(text.clone()),
+                            }),
+                        )
+                        .await;
+                    Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                        text,
+                        Some(false),
+                    )))
+                }
             }
         })
     }
@@ -376,15 +600,71 @@ impl ToolExecutor<ToolInvocation> for EditHandler {
             } else {
                 text.replacen(&args.oldString, &args.newString, 1)
             };
+            let session = invocation.session.clone();
+            let turn = invocation.turn.clone();
+            let call_id = invocation.call_id.clone();
+            let mut changes = HashMap::new();
+            changes.insert(
+                path.clone(),
+                FileChange::Update {
+                    unified_diff: make_unified_diff(&text, &next),
+                    move_path: None,
+                },
+            );
+            session
+                .emit_turn_item_started(
+                    turn.as_ref(),
+                    &TurnItem::FileChange(FileChangeItem {
+                        id: call_id.clone(),
+                        changes: changes.clone(),
+                        status: None,
+                        auto_approved: Some(true),
+                        stdout: None,
+                        stderr: None,
+                    }),
+                )
+                .await;
             match std::fs::write(&path, next.as_bytes()) {
-                Ok(()) => Ok(boxed_tool_output(FunctionToolOutput::from_text(
-                    format!("edited {}", path.display()),
-                    Some(true),
-                ))),
-                Err(e) => Ok(boxed_tool_output(FunctionToolOutput::from_text(
-                    format!("error: {e}"),
-                    Some(false),
-                ))),
+                Ok(()) => {
+                    let msg = format!("edited {}", path.display());
+                    session
+                        .emit_turn_item_completed(
+                            turn.as_ref(),
+                            TurnItem::FileChange(FileChangeItem {
+                                id: call_id.clone(),
+                                changes,
+                                status: Some(PatchApplyStatus::Completed),
+                                auto_approved: None,
+                                stdout: Some(msg.clone()),
+                                stderr: Some(String::new()),
+                            }),
+                        )
+                        .await;
+                    Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                        msg,
+                        Some(true),
+                    )))
+                }
+                Err(e) => {
+                    let msg = format!("error: {e}");
+                    session
+                        .emit_turn_item_completed(
+                            turn.as_ref(),
+                            TurnItem::FileChange(FileChangeItem {
+                                id: call_id.clone(),
+                                changes,
+                                status: Some(PatchApplyStatus::Failed),
+                                auto_approved: None,
+                                stdout: None,
+                                stderr: Some(msg.clone()),
+                            }),
+                        )
+                        .await;
+                    Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                        msg,
+                        Some(false),
+                    )))
+                }
             }
         })
     }
